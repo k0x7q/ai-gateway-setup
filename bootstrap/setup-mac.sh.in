@@ -1,0 +1,138 @@
+#!/bin/bash
+# macOS stock Bash 3.2. This template is rendered by the release builder.
+# The VERSION token is a release tag; the HASHES token becomes case entries:
+#   asset-name) expected="<64 lowercase SHA-256 hex characters>" ;;
+# Do not execute an unrendered template. No runtime download/hash overrides.
+
+umask 077
+VERSION='@@VERSION@@'
+RELEASE_BASE="https://github.com/k0x7q/ai-gateway-setup/releases/download/$VERSION"
+work_dir=''
+temp_parent=''
+result='failure'
+
+cleanup() {
+  [ -n "$work_dir" ] || return 0
+  # Delete only our owned, non-linked, absolute direct child of the resolved
+  # temporary parent. Re-resolve immediately before deletion; never guess.
+  case "$work_dir" in /*) ;; *) return 1 ;; esac
+  [ -n "$temp_parent" ] && [ "$temp_parent" != '/' ] || return 1
+  [ "${work_dir%/*}" = "$temp_parent" ] || return 1
+  case "${work_dir##*/}" in ai-gateway-setup.*) ;; *) return 1 ;; esac
+  [ -d "$work_dir" ] && [ ! -L "$work_dir" ] && [ -O "$work_dir" ] || return 1
+  local resolved
+  resolved=$(cd "$work_dir" && /bin/pwd -P) || return 1
+  [ "$resolved" = "$work_dir" ] || return 1
+  /bin/rm -rf -- "$work_dir" || return 1
+  work_dir=''
+}
+
+finish() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if ! cleanup; then
+    printf '\n临时脚本清理失败；为避免误删，已保留临时目录。\n' >&2
+    [ "$status" -ne 0 ] || status=1
+  fi
+  if [ "$status" -ne 0 ]; then
+    printf '\n在线启动流程未完成（退出码 %s）。请查看上方诊断；安装或配置可能已部分完成。\n' "$status" >&2
+  elif [ "$result" = 'cancel' ]; then
+    printf '\n已取消，未运行安装或配置程序。\n'
+  else
+    # Existing helpers may show a failure dialog but return zero. Do not claim
+    # successful installation/configuration based only on their exit status.
+    printf '\n配置程序已结束，临时脚本已清理。是否完成请以上方配置程序的结果和诊断为准。\n'
+  fi
+  exit "$status"
+}
+trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fail() { printf '%s\n' "$1" >&2; exit 1; }
+
+[ "$(/usr/bin/uname -s)" = 'Darwin' ] || fail '此启动器仅支持 macOS。'
+case "$VERSION" in ''|*[!a-zA-Z0-9._-]*) fail '发布版本无效，请使用正式发布的启动命令。' ;; esac
+
+# The gateway is configuration, not a release download/checksum override.
+# Accept --gateway anywhere alongside the optional product selection.
+gateway=${AI_GATEWAY_URL-}
+choice=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --gateway)
+      [ "$#" -ge 2 ] || fail '--gateway 缺少网关地址。'
+      gateway=$2; shift 2 ;;
+    *)
+      [ -z "$choice" ] || fail '用法：setup-mac.sh --gateway https://网关域名 [claude|codex|cancel]'
+      choice=$1; shift ;;
+  esac
+done
+if [ -z "$choice" ]; then
+  printf '请选择：\n  1) Claude Code：安装并配置\n  2) Codex：仅配置（客户端需自行安装）\n  0) 取消\n请输入 1、2 或 0：'
+  IFS= read -r choice || fail '未读取到选择；请重新运行或传入 claude、codex、cancel。'
+fi
+case "$choice" in
+  1|claude) product='claude' ;;
+  2|codex) product='codex' ;;
+  0|cancel) result='cancel'; exit 0 ;;
+  *) fail '无效选择，请使用 1、2、0 或 claude、codex、cancel。' ;;
+esac
+
+# Validate before any downloads or installation. Do not interpret this as shell code.
+[ -n "$gateway" ] || fail '缺少网关地址，请在启动命令中提供 --gateway https://网关域名。'
+[[ "$gateway" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?/?$ ]] || fail '网关地址必须是 HTTPS 域名地址，不可包含账号、路径、查询参数或片段。'
+gateway=${gateway%/}
+authority=${gateway#https://}
+case "$authority" in
+  *:*) port=${authority##*:}; [ "$((10#$port))" -ge 1 ] && [ "$((10#$port))" -le 65535 ] || fail '网关端口无效。' ;;
+esac
+# Helpers perform authoritative URL parsing before changing anything.
+export AI_GATEWAY_URL="$gateway"
+
+temp_parent=$(cd "${TMPDIR:-/tmp}" && /bin/pwd -P) || fail '无法访问系统临时目录。'
+case "$temp_parent" in /*) ;; *) fail '系统临时目录不是绝对路径。' ;; esac
+[ "$temp_parent" != '/' ] || fail '拒绝使用根目录作为临时目录。'
+work_dir=$(/usr/bin/mktemp -d "$temp_parent/ai-gateway-setup.XXXXXXXX") || fail '无法创建私有临时目录。'
+[ -n "$work_dir" ] || fail '临时目录创建结果无效。'
+/bin/mkdir "$work_dir/helpers" || fail '无法创建辅助文件目录。'
+
+fetch() {
+  local asset="$1" destination="$2" expected='' digest=''
+  case "$asset" in
+@@HASHES@@
+    *) fail '发布清单缺少所需文件的校验值。' ;;
+  esac
+  [ "${#expected}" -eq 64 ] || fail '发布文件校验值无效。'
+  case "$expected" in *[!0-9a-f]*) fail '发布文件校验值无效。' ;; esac
+  printf '正在下载并校验：%s\n' "$asset"
+  /usr/bin/curl --fail --location --silent --show-error \
+    --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --max-time 120 \
+    --retry 2 --retry-delay 1 --retry-max-time 300 \
+    --output "$destination" "$RELEASE_BASE/$asset" || fail '下载失败；未启动安装或配置程序。'
+  [ -f "$destination" ] && [ ! -L "$destination" ] || fail '下载文件不可用；未启动安装或配置程序。'
+  digest=$(/usr/bin/shasum -a 256 "$destination") || fail '无法校验下载文件；未启动安装或配置程序。'
+  digest=${digest%% *}
+  [ "$digest" = "$expected" ] || fail '文件 SHA-256 校验失败；未启动安装或配置程序。'
+}
+
+if [ "$product" = 'claude' ]; then
+  fetch 'claude-mac-setup.rb' "$work_dir/helpers/setup.rb"
+  fetch 'claude-mac-configure.cjs' "$work_dir/helpers/configure.cjs"
+  fetch 'claude-mac-dialogs.cjs' "$work_dir/helpers/dialogs.cjs"
+  helper="$work_dir/helpers/setup.rb"
+else
+  fetch 'codex-mac-codex_setup.rb' "$work_dir/helpers/codex_setup.rb"
+  helper="$work_dir/helpers/codex_setup.rb"
+fi
+
+# All selected siblings are verified before any helper executes. Call Ruby
+# directly so the original double-click launcher's end-of-window wait is avoided.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+[ -x /usr/bin/ruby ] || fail '此 macOS 缺少可执行的系统 Ruby。'
+/usr/bin/ruby "$helper"
+child_status=$?
+result='child-ended'
+exit "$child_status"

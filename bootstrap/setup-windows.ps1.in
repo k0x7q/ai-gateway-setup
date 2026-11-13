@@ -1,0 +1,266 @@
+param(
+    [ValidateSet('claude', 'codex')]
+    [string]$Product,
+    [string]$GatewayUrl = $env:AI_GATEWAY_URL
+)
+
+# Generated release metadata. Run this starter as an in-memory scriptblock.
+$ReleaseVersion = '@@VERSION@@'
+$AssetHashes = @{
+@@HASHES@@
+}
+
+function ConvertTo-GatewayOrigin {
+    param([string]$Value = $env:AI_GATEWAY_URL)
+    if ([string]::IsNullOrEmpty($Value) -or $Value -cnotmatch '^https://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?/?\z') {
+        throw 'Specify AI_GATEWAY_URL / --gateway as an HTTPS host URL without credentials, path, query or fragment.'
+    }
+    $parsed = $null
+    if (-not [uri]::TryCreate($Value, [UriKind]::Absolute, [ref]$parsed) -or
+        $parsed.Scheme -cne 'https' -or [string]::IsNullOrEmpty($parsed.Host) -or
+        $parsed.Port -lt 1 -or $parsed.Port -gt 65535) {
+        throw 'Invalid HTTPS gateway host or port.'
+    }
+    return $parsed.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
+}
+
+function Get-GatewayAssets {
+    param([ValidateSet('claude', 'codex')][string]$Product)
+    if ($Product -eq 'claude') {
+        return @(
+            @{ Asset = 'claude-windows-Setup.ps1'; Local = 'Setup.ps1' },
+            @{ Asset = 'claude-windows-configure.cjs'; Local = 'configure.cjs' },
+            @{ Asset = 'claude-windows-dialogs.cjs'; Local = 'dialogs.cjs' },
+            @{ Asset = 'claude-windows-key-dialog.ps1'; Local = 'key-dialog.ps1' }
+        )
+    }
+    return @(
+        @{ Asset = 'codex-windows-Setup.ps1'; Local = 'Setup.ps1' },
+        @{ Asset = 'codex-windows-ConfigCore.ps1'; Local = 'ConfigCore.ps1' }
+    )
+}
+
+function Read-GatewayProduct {
+    Write-Host '1. Claude Code - install and configure'
+    Write-Host '2. Codex - configure only (install the client yourself)'
+    Write-Host '0. Cancel'
+    while ($true) {
+        switch ((Read-Host 'Choose 1, 2 or 0').Trim()) {
+            '1' { return 'claude' }
+            '2' { return 'codex' }
+            '0' { return '' }
+            default { Write-Host 'Please enter 1, 2 or 0.' }
+        }
+    }
+}
+
+function New-GatewayPrivateDirectory {
+    param([string]$TempRoot)
+    $root = [IO.Path]::GetFullPath($TempRoot).TrimEnd('\', '/')
+    if (-not [IO.Directory]::Exists($root)) { throw 'Temporary root does not exist.' }
+    $path = Join-Path $root ('ai-gateway-' + [guid]::NewGuid().ToString('N'))
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetOwner($identity.User)
+    $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $propagate = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    foreach ($sid in @($identity.User, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+        $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, [Security.AccessControl.FileSystemRights]::FullControl, $inherit, $propagate, $allow)
+        [void]$acl.AddAccessRule($rule)
+    }
+    # Create with restrictive ACL, rather than tightening a previously public directory.
+    [void][IO.Directory]::CreateDirectory($path, $acl)
+    return [IO.Path]::GetFullPath($path)
+}
+
+function Remove-GatewayPrivateDirectory {
+    param([string]$Path, [string]$TempRoot, [string]$TrackedPath)
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($TrackedPath)) {
+        throw 'Refusing cleanup without a tracked temporary directory.'
+    }
+    if (-not [IO.Path]::IsPathRooted($Path) -or -not [IO.Path]::IsPathRooted($TrackedPath)) {
+        throw 'Refusing cleanup of a relative path.'
+    }
+    $root = [IO.Path]::GetFullPath($TempRoot).TrimEnd('\', '/')
+    $absolute = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $tracked = [IO.Path]::GetFullPath($TrackedPath).TrimEnd('\', '/')
+    if (-not [string]::Equals($absolute, $tracked, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals([IO.Path]::GetDirectoryName($absolute), $root, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($absolute) -cnotmatch '^ai-gateway-[0-9a-f]{32}$') {
+        throw 'Refusing cleanup outside the tracked direct-child temporary directory.'
+    }
+    if (-not (Test-Path -LiteralPath $absolute)) { return }
+    $pending = New-Object 'Collections.Generic.Stack[string]'
+    $pending.Push($absolute)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Refusing cleanup of a directory tree containing a reparse link.'
+        }
+        if (-not $item.PSIsContainer) { throw 'Temporary directory is no longer a directory.' }
+        foreach ($child in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Refusing cleanup of a directory tree containing a reparse link.'
+            }
+            if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+        }
+    }
+    # Delete only after the absolute tracked path and the complete tree were checked.
+    [IO.Directory]::Delete($absolute, $true)
+}
+
+function Invoke-GatewayDownload {
+    param([string]$Uri, [string]$Destination)
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
+    $next = [uri]$Uri
+    $response = $null
+    $inputStream = $null
+    $outputStream = $null
+    try {
+        for ($redirects = 0; $redirects -le 5; $redirects++) {
+            if ($next.Scheme -cne 'https') { throw 'Only HTTPS downloads are permitted.' }
+            $remaining = 120000 - [int]$deadline.ElapsedMilliseconds
+            if ($remaining -le 0) { throw 'Download timed out.' }
+            $request = [Net.HttpWebRequest]::Create($next)
+            $request.AllowAutoRedirect = $false
+            $request.Timeout = [Math]::Min(60000, $remaining)
+            $request.ReadWriteTimeout = [Math]::Min(30000, $remaining)
+            $request.UserAgent = 'ai-gateway-setup'
+            # Use the platform certificate validation; never install a bypass callback.
+            $response = $request.GetResponse()
+            $status = [int]$response.StatusCode
+            if ($status -in @(301, 302, 303, 307, 308)) {
+                $location = $response.Headers['Location']
+                if ([string]::IsNullOrWhiteSpace($location)) { throw 'Redirect has no destination.' }
+                $next = [uri]::new($next, $location)
+                $response.Close()
+                $response = $null
+                continue
+            }
+            if ($status -ne 200) { throw ('Unexpected HTTP status: ' + $status) }
+            if ($response.ContentLength -gt 16777216) { throw 'Release asset exceeds size limit.' }
+            $inputStream = $response.GetResponseStream()
+            $outputStream = [IO.FileStream]::new($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $buffer = New-Object byte[] 65536
+            $total = 0
+            while ($true) {
+                $remaining = 120000 - [int]$deadline.ElapsedMilliseconds
+                if ($remaining -le 0) { throw 'Download timed out.' }
+                if ($inputStream.CanTimeout) { $inputStream.ReadTimeout = [Math]::Min(30000, $remaining) }
+                $count = $inputStream.Read($buffer, 0, $buffer.Length)
+                if ($count -eq 0) { break }
+                $total += $count
+                if ($total -gt 16777216) { throw 'Release asset exceeds size limit.' }
+                $outputStream.Write($buffer, 0, $count)
+            }
+            return
+        }
+        throw 'Too many download redirects.'
+    }
+    finally {
+        if ($null -ne $outputStream) { $outputStream.Dispose() }
+        if ($null -ne $inputStream) { $inputStream.Dispose() }
+        if ($null -ne $response) { $response.Close() }
+        $deadline.Stop()
+    }
+}
+
+function Invoke-GatewayChild {
+    param([string]$Helper)
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not [IO.File]::Exists($powershell)) { throw 'Windows PowerShell was not found.' }
+    & $powershell -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File $Helper | Out-Host
+    return [int]$LASTEXITCODE
+}
+
+function Invoke-GatewayBootstrap {
+    param(
+        [ValidateSet('claude', 'codex', '')][string]$Product = '',
+        [string]$Version,
+        [hashtable]$Hashes,
+        [string]$GatewayUrl = $env:AI_GATEWAY_URL
+    )
+    $oldTls = [Net.ServicePointManager]::SecurityProtocol
+    $oldProgress = $ProgressPreference
+    $oldGateway = $env:AI_GATEWAY_URL
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
+    $tracked = $null
+    $exitCode = 1
+    $childEnded = $false
+    try {
+        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
+            $PSVersionTable.PSVersion -lt [version]'5.1' -or $PSVersionTable.PSEdition -ne 'Desktop') {
+            throw 'Use Windows PowerShell 5.1 (Desktop) on Windows; PowerShell Core/7 is not supported.'
+        }
+        if ([string]::IsNullOrEmpty($Product)) { $Product = Read-GatewayProduct }
+        if ([string]::IsNullOrEmpty($Product)) {
+            Write-Host 'Cancelled. No setup files were downloaded.'
+            return 0
+        }
+        $env:AI_GATEWAY_URL = ConvertTo-GatewayOrigin $GatewayUrl
+        if ($Version -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { throw 'Invalid release version.' }
+        $assets = @(Get-GatewayAssets -Product $Product)
+        foreach ($entry in $assets) {
+            if (-not $Hashes.ContainsKey($entry.Asset) -or $Hashes[$entry.Asset] -notmatch '^[0-9a-fA-F]{64}$') {
+                throw ('Missing or invalid embedded SHA256: ' + $entry.Asset)
+            }
+        }
+        [Net.ServicePointManager]::SecurityProtocol = $oldTls -bor [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
+        $tracked = New-GatewayPrivateDirectory -TempRoot $tempRoot
+        $helpers = Join-Path $tracked 'helpers'
+        [void][IO.Directory]::CreateDirectory($helpers)
+        foreach ($entry in $assets) {
+            $destination = Join-Path $helpers $entry.Local
+            $uri = 'https://github.com/k0x7q/ai-gateway-setup/releases/download/' + $Version + '/' + $entry.Asset
+            Write-Host ('Downloading ' + $entry.Asset + ' ...')
+            Invoke-GatewayDownload -Uri $uri -Destination $destination
+            $downloadedFile = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
+            if ($downloadedFile.PSIsContainer -or ($downloadedFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw ('Release asset is not a regular file: ' + $entry.Asset)
+            }
+            $actual = (Get-FileHash -LiteralPath $destination -Algorithm SHA256 -ErrorAction Stop).Hash
+            if (-not [string]::Equals($actual, $Hashes[$entry.Asset], [StringComparison]::OrdinalIgnoreCase)) {
+                throw ('SHA256 verification failed: ' + $entry.Asset)
+            }
+        }
+        # Every selected asset must pass verification before any helper executes.
+        $exitCode = Invoke-GatewayChild -Helper (Join-Path $helpers 'Setup.ps1')
+        $childEnded = $true
+    }
+    catch {
+        Write-Host ('Bootstrap failed: ' + $_.Exception.Message) -ForegroundColor Red
+        Write-Host 'Installation or configuration may have partially completed if setup had already started.'
+        $exitCode = 1
+    }
+    finally {
+        [Net.ServicePointManager]::SecurityProtocol = $oldTls
+        $ProgressPreference = $oldProgress
+        $env:AI_GATEWAY_URL = $oldGateway
+        if ($null -ne $tracked) {
+            try { Remove-GatewayPrivateDirectory -Path $tracked -TempRoot $tempRoot -TrackedPath $tracked }
+            catch {
+                Write-Warning ('Temporary cleanup was refused or failed: ' + $_.Exception.Message + ' Directory: ' + $tracked)
+                # Preserve the setup exit code; cleanup failure is separately visible.
+            }
+        }
+    }
+    if ($childEnded) {
+        Write-Host 'Setup process ended. Refer to the original setup results above or its diagnostic window.'
+        # Codex may report errors in its own UI while returning zero: do not claim success.
+    }
+    return [int]$exitCode
+}
+
+$bootstrapExit = Invoke-GatewayBootstrap -Product $Product -Version $ReleaseVersion -Hashes $AssetHashes -GatewayUrl $GatewayUrl
+if ($MyInvocation.MyCommand -is [Management.Automation.ExternalScriptInfo] -and $MyInvocation.InvocationName -ne '.') {
+    # A real -File invocation owns its process exit code.
+    exit $bootstrapExit
+}
+# An in-memory starter must not close an existing interactive PowerShell session.
+# Publish the child status for callers, and leave the original results visible.
+$global:LASTEXITCODE = [int]$bootstrapExit
