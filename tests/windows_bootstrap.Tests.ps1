@@ -1,4 +1,4 @@
-# Standalone Windows PowerShell 5.1 tests. No Pester, network, GUI or installation.
+﻿# Standalone Windows PowerShell 5.1 tests. No Pester, network, GUI or installation.
 param([string]$StarterPath = (Join-Path $PSScriptRoot '..\dist\setup-windows.ps1'))
 $ErrorActionPreference = 'Stop'
 $passed = 0
@@ -37,7 +37,7 @@ $definitions = @($ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $false))
 foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
-Assert-True ($definitions.Count -eq 8) 'Expected standalone function contract.'
+Assert-True ($definitions.Count -eq 9) 'Expected standalone function contract, including isolated product dialog.'
 $realRemove = ${function:Remove-GatewayPrivateDirectory}
 $realRead = ${function:Read-GatewayProduct}
 $realNew = ${function:New-GatewayPrivateDirectory}
@@ -215,13 +215,75 @@ try {
         Assert-True ((Invoke-GatewayBootstrap -Product codex -Version v1.2.3 -Hashes $hashes) -eq 1) 'Download failure exit.'
         Assert-True ($script:executed -eq 0 -and -not [IO.Directory]::Exists($script:lastDirectory)) 'Failure cleanup.'
     }
-    Test-Case 'Menu mapping and invalid-input retry' {
-        $script:answers = New-Object 'Collections.Generic.Queue[string]'
-        foreach ($answer in @('invalid', '1', '2', '0')) { $script:answers.Enqueue($answer) }
-        function Read-Host { param([string]$Prompt) return $script:answers.Dequeue() }
-        Assert-True ((& $script:realRead) -eq 'claude') '1 means Claude, invalid retried.'
-        Assert-True ((& $script:realRead) -eq 'codex') '2 means Codex.'
-        Assert-True ((& $script:realRead) -eq '') '0 means cancel.'
+    Test-Case 'Popup mapping, close contract and encoded UI syntax without real GUI' {
+        function Invoke-GatewayProductDialog {
+            param([string]$EncodedCommand)
+            $script:dialogSource = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($EncodedCommand))
+            return [pscustomobject]@{ ExitCode = 0; Output = $script:dialogOutput }
+        }
+        $apartment = [Threading.Thread]::CurrentThread.GetApartmentState()
+        $script:dialogOutput = "claude`r`n"
+        Assert-True ((& $script:realRead) -ceq 'claude') 'Claude button selects Claude.'
+        $script:dialogOutput = "codex`r`n"
+        Assert-True ((& $script:realRead) -ceq 'codex') 'Codex button selects Codex.'
+        $script:dialogOutput = "cancel`r`n"
+        Assert-True ((& $script:realRead) -ceq '') 'Cancel returns without selecting a product.'
+        Assert-True ($script:dialogSource.Contains('$form.CancelButton = $cancel') -and
+            $script:dialogSource.Contains('[Windows.Forms.DialogResult]::Cancel')) 'Escape and close are handled as cancellation.'
+        Assert-True (-not $script:dialogSource.Contains('https://gateway.example.com')) 'Fixed UI code does not interpolate gateway or credentials.'
+        $dialogTokens = $null; $dialogErrors = $null
+        [void][Management.Automation.Language.Parser]::ParseInput($script:dialogSource, [ref]$dialogTokens, [ref]$dialogErrors)
+        Assert-True (@($dialogErrors).Count -eq 0) 'Encoded UI code parses in PS5.1.'
+        Assert-True ([Threading.Thread]::CurrentThread.GetApartmentState() -eq $apartment) 'Caller apartment unchanged.'
+        $launcher = @($definitions | Where-Object { $_.Name -eq 'Invoke-GatewayProductDialog' })[0].Extent.Text
+        Assert-True ($launcher.Contains('-STA') -and $launcher.Contains('-EncodedCommand') -and
+            $launcher.Contains('$start.UseShellExecute = $false')) 'Dialog uses isolated STA process with fixed encoded code.'
+        Assert-True (-not $source.Contains('Read-Host')) 'Starter does not require numeric terminal input.'
+    }
+    Test-Case 'Popup errors and malformed replies stop before staging' {
+        function Invoke-GatewayProductDialog {
+            param([string]$EncodedCommand)
+            return [pscustomobject]@{ ExitCode = $script:dialogExit; Output = $script:dialogOutput }
+        }
+        function Read-GatewayProduct { return (& $script:realRead) }
+        foreach ($reply in @(
+            @{ Exit = 1; Output = 'cancel' }, @{ Exit = 0; Output = '' },
+            @{ Exit = 0; Output = 'unknown' }, @{ Exit = 0; Output = "claude`ncodex" },
+            @{ Exit = 0; Output = 'CLAUDE' })) {
+            Reset-Mocks
+            $script:dialogExit = $reply.Exit; $script:dialogOutput = $reply.Output
+            $result = Invoke-GatewayBootstrap -Version v1.2.3 -Hashes $hashes
+            Assert-True ($result -eq 1 -and $script:executed -eq 0 -and
+                $script:downloaded.Count -eq 0 -and $null -eq $script:lastDirectory) 'Dialog failure must not stage, download or execute.'
+        }
+    }
+    Test-Case 'Both products show concise progress and no successful asset filenames' {
+        foreach ($productName in @('claude', 'codex')) {
+            Reset-Mocks
+            $script:childExit = 0
+            $records = @(Invoke-GatewayBootstrap -Product $productName -Version v1.2.3 -Hashes $hashes 6>&1)
+            Assert-True ($records[-1] -eq 0) 'Setup completes with expected exit.'
+            $text = ($records | Where-Object { $_ -is [Management.Automation.InformationRecord] } |
+                ForEach-Object { $_.MessageData.ToString() }) -join "`n"
+            Assert-True ($text.Contains('正在准备配置工具') -and $text.Contains('配置工具下载及完整性校验通过')) 'Single preparation and completion messages.'
+            foreach ($entry in @(Get-GatewayAssets $productName)) {
+                Assert-True (-not $text.Contains($entry.Asset)) 'Successful progress hides technical asset filenames.'
+            }
+        }
+    }
+    Test-Case 'Download and checksum failures keep asset diagnostics' {
+        Reset-Mocks
+        $script:downloadFailure = $true
+        $records = @(Invoke-GatewayBootstrap -Product codex -Version v1.2.3 -Hashes $hashes 6>&1)
+        $text = ($records | ForEach-Object { $_.ToString() }) -join "`n"
+        Assert-True ($records[-1] -eq 1 -and $text.Contains('codex-windows-Setup.ps1')) 'Download failure names the affected asset.'
+        Assert-True (-not $text.Contains('完整性校验通过')) 'No false verification success.'
+        Reset-Mocks
+        $script:corruptAsset = 'claude-windows-key-dialog.ps1'
+        $records = @(Invoke-GatewayBootstrap -Product claude -Version v1.2.3 -Hashes $hashes 6>&1)
+        $text = ($records | ForEach-Object { $_.ToString() }) -join "`n"
+        Assert-True ($records[-1] -eq 1 -and $text.Contains($script:corruptAsset)) 'Hash failure names the affected asset.'
+        Assert-True (-not $text.Contains('完整性校验通过')) 'Failed hash never reports all assets verified.'
     }
     Test-Case 'Cleanup refuses untracked, relative, parent and nested paths' {
         $child = Join-Path $testRoot ('ai-gateway-' + [guid]::NewGuid().ToString('N'))

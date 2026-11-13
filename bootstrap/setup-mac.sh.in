@@ -70,8 +70,21 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 if [ -z "$choice" ]; then
-  printf '请选择：\n  1) Claude Code：安装并配置\n  2) Codex：仅配置（客户端需自行安装）\n  0) 取消\n请输入 1、2 或 0：'
-  IFS= read -r choice || fail '未读取到选择；请重新运行或传入 claude、codex、cancel。'
+  choice=$(/usr/bin/osascript <<'APPLESCRIPT'
+try
+    set selected to button returned of (display dialog ("请选择要配置的客户端：" & return & return & "Claude Code：安装并配置" & return & "Codex：仅配置（客户端需自行安装）") with title "AI Gateway Setup" buttons {"取消", "Codex", "Claude Code"} default button "Claude Code" cancel button "取消")
+    if selected is "Claude Code" then
+        return "claude"
+    else if selected is "Codex" then
+        return "codex"
+    else
+        error "Unexpected product selection"
+    end if
+on error number -128
+    return "cancel"
+end try
+APPLESCRIPT
+  ) || fail '无法打开客户端选择窗口；未运行安装或配置程序。可重新运行，或传入 claude、codex、cancel。'
 fi
 case "$choice" in
   1|claude) product='claude' ;;
@@ -106,18 +119,18 @@ fetch() {
   esac
   [ "${#expected}" -eq 64 ] || fail '发布文件校验值无效。'
   case "$expected" in *[!0-9a-f]*) fail '发布文件校验值无效。' ;; esac
-  printf '正在下载并校验：%s\n' "$asset"
   /usr/bin/curl --fail --location --silent --show-error \
     --proto '=https' --proto-redir '=https' \
     --connect-timeout 15 --max-time 120 \
     --retry 2 --retry-delay 1 --retry-max-time 300 \
-    --output "$destination" "$RELEASE_BASE/$asset" || fail '下载失败；未启动安装或配置程序。'
-  [ -f "$destination" ] && [ ! -L "$destination" ] || fail '下载文件不可用；未启动安装或配置程序。'
-  digest=$(/usr/bin/shasum -a 256 "$destination") || fail '无法校验下载文件；未启动安装或配置程序。'
+    --output "$destination" "$RELEASE_BASE/$asset" || fail "下载失败（${asset}）；未启动安装或配置程序。"
+  [ -f "$destination" ] && [ ! -L "$destination" ] || fail "下载文件不可用（${asset}）；未启动安装或配置程序。"
+  digest=$(/usr/bin/shasum -a 256 "$destination") || fail "无法校验下载文件（${asset}）；未启动安装或配置程序。"
   digest=${digest%% *}
-  [ "$digest" = "$expected" ] || fail '文件 SHA-256 校验失败；未启动安装或配置程序。'
+  [ "$digest" = "$expected" ] || fail "文件 SHA-256 校验失败（${asset}）；未启动安装或配置程序。"
 }
 
+printf '正在准备配置工具……\n'
 if [ "$product" = 'claude' ]; then
   fetch 'claude-mac-setup.rb' "$work_dir/helpers/setup.rb"
   fetch 'claude-mac-configure.cjs' "$work_dir/helpers/configure.cjs"
@@ -127,6 +140,8 @@ else
   fetch 'codex-mac-codex_setup.rb' "$work_dir/helpers/codex_setup.rb"
   helper="$work_dir/helpers/codex_setup.rb"
 fi
+
+printf '配置工具下载及完整性校验通过。\n'
 
 # All selected siblings are verified before any helper executes. Call Ruby
 # directly so the original double-click launcher's end-of-window wait is avoided.

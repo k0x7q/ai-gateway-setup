@@ -42,6 +42,16 @@ class MacBootstrapTests(unittest.TestCase):
         self.mode = self.root / "mode.json"
         self.mode.write_text("{}", encoding="utf-8")
         self.stub_uname = self.stub("uname", "print('Darwin')\n")
+        self.dialog_log = self.root / 'dialog.applescript'
+        self.stub_dialog = self.stub('osascript', f"""
+import json, pathlib, sys
+root = pathlib.Path({str(self.root)!r})
+(root / 'dialog.applescript').write_text(sys.stdin.read())
+mode = json.loads((root / 'mode.json').read_text())
+if mode.get('dialog_exit'):
+    sys.exit(mode['dialog_exit'])
+print(mode.get('dialog_choice', 'claude'))
+""")
         self.stub_curl = self.stub("curl", f"""
 import json, pathlib, sys
 root = pathlib.Path({str(self.root)!r})
@@ -89,6 +99,7 @@ sys.exit(mode.get('child_exit', 0))
             ("/usr/bin/curl", self.stub_curl),
             ("/usr/bin/shasum", self.stub_hash),
             ("/usr/bin/ruby", self.stub_ruby),
+            ("/usr/bin/osascript", self.stub_dialog),
         ):
             # Paths are shell quoted even though fixture directory has spaces.
             self.script = self.script.replace(executable, shlex.quote(str(stub)))
@@ -143,27 +154,66 @@ sys.exit(mode.get('child_exit', 0))
         self.assertNotIn("配置成功", result.stdout)
         self.assertNotIn("安装成功", result.stdout)
 
-    def test_codex_menu_success_only_one_file(self):
-        result = self.run_bootstrap(input_text="2\n")
+    def assert_quiet_preparation(self, result):
+        self.assertEqual(result.stdout.count('正在准备配置工具'), 1)
+        self.assertEqual(result.stdout.count('配置工具下载及完整性校验通过'), 1)
+        for asset in ASSETS:
+            self.assertNotIn(asset, result.stdout)
+        self.assertNotIn('请输入', result.stdout)
+
+    def test_codex_popup_success_only_one_file(self):
+        result = self.run_bootstrap(dialog_choice='codex')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.fetched()), 1)
         record = json.loads(self.ruby_log.read_text())
-        self.assertEqual(set(record["files"]), {"codex_setup.rb"})
-        self.assertIn("仅配置", result.stdout)
+        self.assertEqual(set(record['files']), {'codex_setup.rb'})
+        self.assert_quiet_preparation(result)
+        self.assertIn('客户端需自行安装', self.dialog_log.read_text())
 
-    def test_cancel_argument_and_menu_do_not_download_or_execute(self):
-        for args, text in ((["cancel"], None), ([], "0\n")):
+    def test_claude_popup_success_and_quiet_progress(self):
+        result = self.run_bootstrap(dialog_choice='claude')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.fetched()), 3)
+        self.assert_quiet_preparation(result)
+        source = self.dialog_log.read_text()
+        self.assertIn('buttons {"取消", "Codex", "Claude Code"}', source)
+        self.assertIn('cancel button "取消"', source)
+        self.assertIn('on error number -128', source)
+        self.assertIn('return "cancel"', source)
+        self.assertNotIn('https://gateway.example.com', source)
+
+    def test_explicit_product_bypasses_popup(self):
+        result = self.run_bootstrap('codex', dialog_exit=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.dialog_log.exists())
+        self.assert_quiet_preparation(result)
+
+    def test_cancel_argument_and_popup_do_not_download_or_execute(self):
+        for args in (['cancel'], []):
             with self.subTest(args=args):
-                result = self.run_bootstrap(*args, input_text=text)
+                result = self.run_bootstrap(*args, dialog_choice='cancel')
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("已取消", result.stdout)
+                self.assertIn('已取消', result.stdout)
+                self.assertNotIn('正在准备', result.stdout)
                 self.assertFalse(self.fetch_log.exists())
                 self.assertFalse(self.ruby_log.exists())
+
+    def test_popup_failure_and_invalid_result_fail_before_staging(self):
+        for mode in ({'dialog_exit': 1}, {'dialog_choice': ''},
+                     {'dialog_choice': 'unexpected'}, {'dialog_choice': 'claude\ncodex'}):
+            with self.subTest(mode=mode):
+                result = self.run_bootstrap(**mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.fetch_log.exists())
+                self.assertFalse(self.ruby_log.exists())
+                self.assertNotIn('正在准备', result.stdout)
 
     def test_last_claude_hash_mismatch_never_executes_ruby(self):
         result = self.run_bootstrap("claude", corrupt="claude-mac-dialogs.cjs")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("SHA-256", result.stderr)
+        self.assertIn('claude-mac-dialogs.cjs', result.stderr)
+        self.assertNotIn('完整性校验通过', result.stdout)
         self.assertEqual(len(self.fetched()), 3)
         self.assertFalse(self.ruby_log.exists())
 
@@ -171,6 +221,8 @@ sys.exit(mode.get('child_exit', 0))
         result = self.run_bootstrap("codex", fetch_fail="codex-mac-codex_setup.rb")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("下载失败", result.stderr)
+        self.assertIn('codex-mac-codex_setup.rb', result.stderr)
+        self.assertNotIn('完整性校验通过', result.stdout)
         self.assertFalse(self.ruby_log.exists())
 
     def test_child_nonzero_preserved_and_cleaned(self):

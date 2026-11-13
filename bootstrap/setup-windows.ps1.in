@@ -40,17 +40,85 @@ function Get-GatewayAssets {
     )
 }
 
+function Invoke-GatewayProductDialog {
+    param([string]$EncodedCommand)
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not [IO.File]::Exists($powershell)) { throw 'Windows PowerShell was not found.' }
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $powershell
+    $start.Arguments = '-NoLogo -NoProfile -NonInteractive -STA -WindowStyle Hidden -EncodedCommand ' + $EncodedCommand
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw 'Unable to start the client selection window.' }
+        # Drain both pipes while the user chooses; do not change the caller's apartment.
+        $output = $process.StandardOutput.ReadToEndAsync()
+        $errors = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        [void]$errors.Result
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $output.Result }
+    }
+    finally { $process.Dispose() }
+}
+
 function Read-GatewayProduct {
-    Write-Host '1. Claude Code - install and configure'
-    Write-Host '2. Codex - configure only (install the client yourself)'
-    Write-Host '0. Cancel'
-    while ($true) {
-        switch ((Read-Host 'Choose 1, 2 or 0').Trim()) {
-            '1' { return 'claude' }
-            '2' { return 'codex' }
-            '0' { return '' }
-            default { Write-Host 'Please enter 1, 2 or 0.' }
-        }
+    # Fixed, local UI code only: no download, temporary script or user interpolation.
+    $dialog = @'
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[Windows.Forms.Application]::EnableVisualStyles()
+$form = New-Object Windows.Forms.Form
+try {
+    $form.Text = 'AI Gateway Setup'
+    $form.ClientSize = New-Object Drawing.Size(480, 180)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.TopMost = $true
+    $label = New-Object Windows.Forms.Label
+    $label.SetBounds(20, 20, 440, 80)
+    $label.Text = "请选择要配置的客户端：`r`n`r`nClaude Code：安装并配置`r`nCodex：仅配置（客户端需自行安装）"
+    $form.Controls.Add($label)
+    $claude = New-Object Windows.Forms.Button
+    $claude.Text = 'Claude Code'
+    $claude.SetBounds(20, 125, 140, 35)
+    $claude.DialogResult = [Windows.Forms.DialogResult]::Yes
+    $form.Controls.Add($claude)
+    $codex = New-Object Windows.Forms.Button
+    $codex.Text = 'Codex'
+    $codex.SetBounds(170, 125, 140, 35)
+    $codex.DialogResult = [Windows.Forms.DialogResult]::No
+    $form.Controls.Add($codex)
+    $cancel = New-Object Windows.Forms.Button
+    $cancel.Text = '取消'
+    $cancel.SetBounds(320, 125, 140, 35)
+    $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $form.Controls.Add($cancel)
+    $form.AcceptButton = $claude
+    $form.CancelButton = $cancel
+    switch ($form.ShowDialog()) {
+        ([Windows.Forms.DialogResult]::Yes) { [Console]::WriteLine('claude') }
+        ([Windows.Forms.DialogResult]::No) { [Console]::WriteLine('codex') }
+        ([Windows.Forms.DialogResult]::Cancel) { [Console]::WriteLine('cancel') }
+        default { throw 'Unexpected client selection result.' }
+    }
+}
+finally { $form.Dispose() }
+'@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($dialog))
+    $reply = Invoke-GatewayProductDialog -EncodedCommand $encoded
+    if ($reply.ExitCode -ne 0) { throw ('无法打开客户端选择窗口；未运行安装或配置程序。退出码：' + $reply.ExitCode) }
+    switch -CaseSensitive (([string]$reply.Output).Trim()) {
+        'claude' { return 'claude' }
+        'codex' { return 'codex' }
+        'cancel' { return '' }
+        default { throw '客户端选择窗口返回了无效结果；未运行安装或配置程序。' }
     }
 }
 
@@ -214,20 +282,24 @@ function Invoke-GatewayBootstrap {
         $tracked = New-GatewayPrivateDirectory -TempRoot $tempRoot
         $helpers = Join-Path $tracked 'helpers'
         [void][IO.Directory]::CreateDirectory($helpers)
+        Write-Host '正在准备配置工具……'
         foreach ($entry in $assets) {
             $destination = Join-Path $helpers $entry.Local
             $uri = 'https://github.com/k0x7q/ai-gateway-setup/releases/download/' + $Version + '/' + $entry.Asset
-            Write-Host ('Downloading ' + $entry.Asset + ' ...')
-            Invoke-GatewayDownload -Uri $uri -Destination $destination
-            $downloadedFile = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
-            if ($downloadedFile.PSIsContainer -or ($downloadedFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw ('Release asset is not a regular file: ' + $entry.Asset)
+            try {
+                Invoke-GatewayDownload -Uri $uri -Destination $destination
+                $downloadedFile = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
+                if ($downloadedFile.PSIsContainer -or ($downloadedFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw 'Release asset is not a regular file.'
+                }
+                $actual = (Get-FileHash -LiteralPath $destination -Algorithm SHA256 -ErrorAction Stop).Hash
+                if (-not [string]::Equals($actual, $Hashes[$entry.Asset], [StringComparison]::OrdinalIgnoreCase)) {
+                    throw 'SHA256 verification failed.'
+                }
             }
-            $actual = (Get-FileHash -LiteralPath $destination -Algorithm SHA256 -ErrorAction Stop).Hash
-            if (-not [string]::Equals($actual, $Hashes[$entry.Asset], [StringComparison]::OrdinalIgnoreCase)) {
-                throw ('SHA256 verification failed: ' + $entry.Asset)
-            }
+            catch { throw ('配置工具下载或校验失败（' + $entry.Asset + '）：' + $_.Exception.Message) }
         }
+        Write-Host '配置工具下载及完整性校验通过。'
         # Every selected asset must pass verification before any helper executes.
         $exitCode = Invoke-GatewayChild -Helper (Join-Path $helpers 'Setup.ps1')
         $childEnded = $true

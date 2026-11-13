@@ -458,7 +458,7 @@ module ClaudeInstaller
     ENV['AI_GATEWAY_URL'] = gateway_origin
     raise Failure.new('仅支持 macOS，请使用对应系统的安装包。', 'MAC_PLATFORM') unless supported_platform?
     raise Failure.new('请不要用 sudo 运行本脚本，请以日常使用电脑的账号双击运行。', 'MAC_ROOT') if Process.euid.zero?
-    puts '正在检查辅助文件和配置……'
+    puts '正在检查现有配置……'
     shared = File.expand_path('configure.cjs', __dir__)
     prepared = preflight(shared)
     stage('key')
