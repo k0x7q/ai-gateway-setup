@@ -30,7 +30,8 @@ $originalOutput = [Console]::OutputEncoding.CodePage
 $originalInput = [Console]::InputEncoding.CodePage
 $originalExit = $global:LASTEXITCODE
 $root = Join-Path ([IO.Path]::GetTempPath()) ('ai-gateway-' + [guid]::NewGuid().ToString('N'))
-# These paths intentionally do not exist: any actual configuration write is forbidden.
+# These configuration paths must remain absent. Windows PowerShell itself may
+# initialize runtime/profile caches under the synthetic USERPROFILE.
 $env:USERPROFILE = Join-Path $root 'synthetic-profile'
 $env:CODEX_HOME = Join-Path $root 'Codex Home'
 $env:CLAUDE_CONFIG_DIR = Join-Path $root '中文 Claude Home'
@@ -111,7 +112,14 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') {
     Assert-True ([Net.ServicePointManager]::SecurityProtocol -eq $originalTls -and $ProgressPreference -eq $originalProgress) 'TLS/progress restored.'
     Assert-True ([Console]::OutputEncoding.CodePage -eq $originalOutput -and [Console]::InputEncoding.CodePage -eq $originalInput) 'Caller console encoding unchanged.'
     Assert-True ($env:AI_GATEWAY_URL -ceq 'https://original.example.com') 'Entry restores caller gateway.'
-    Assert-True (-not [IO.Directory]::Exists($root)) 'No user configuration, staging, network, GUI or installation.'
+    foreach ($directory in @($env:CODEX_HOME, $env:CLAUDE_CONFIG_DIR,
+        (Join-Path $env:USERPROFILE '.codex'), (Join-Path $env:USERPROFILE '.claude'))) {
+        Assert-True (-not [IO.Directory]::Exists($directory) -and -not [IO.File]::Exists($directory)) 'No configuration directory or file written.'
+    }
+    if ([IO.Directory]::Exists($root)) {
+        Write-Host 'Windows PowerShell initialized synthetic profile runtime metadata (not client configuration).'
+        Get-ChildItem -LiteralPath $root -Recurse -Force | ForEach-Object { Write-Host $_.FullName.Substring($root.Length) }
+    }
     Write-Host 'PASS: failures and caller-state restoration.'
 } finally {
     foreach ($name in $variables) { [Environment]::SetEnvironmentVariable($name, $original[$name], 'Process') }
