@@ -20,13 +20,13 @@
 
 ### Windows
 
-打开系统自带的 **Windows PowerShell**（不是命令提示符，也不要以管理员身份运行），将 `https://gateway.example.com` 替换为实际网关地址，粘贴整行并按回车：
+打开 **Windows PowerShell 或 PowerShell 7**（不是命令提示符；普通权限、管理员权限均可），将 `https://gateway.example.com` 替换为实际网关地址，粘贴整行并按回车：
 
 ```powershell
 & { $ErrorActionPreference = 'Stop'; $oldTls = [Net.ServicePointManager]::SecurityProtocol; try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 180 -Uri 'https://github.com/k0x7q/ai-gateway-setup/releases/latest/download/setup-windows.ps1'; $s = if ($r.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($r.Content) } else { [string]$r.Content }; & ([scriptblock]::Create($s.TrimStart([char]0xfeff))) -GatewayUrl 'https://gateway.example.com' } finally { [Net.ServicePointManager]::SecurityProtocol = $oldTls } }
 ```
 
-建议 Windows 10/11，使用 Windows PowerShell 5.1。启动器会单独启动 STA 模式的配置子进程，不会永久修改系统执行策略。
+支持 Windows 10/11 的 Windows PowerShell 5.1 和 PowerShell 7。PowerShell 7 会自动调用系统自带的 Windows PowerShell 5.1，无需手动换窗口或安装其他 PowerShell；启动器会单独启动 STA 模式的配置子进程，不会永久修改系统执行策略。两种权限下均按运行脚本的当前账号及其环境变量定位配置，不扫描其他用户；系统级安装按需请求 UAC 授权。
 
 网关地址必须为 HTTPS 域名或 IPv4 地址，可带端口及末尾 `/`，不可包含账号、其他路径、查询参数或片段；暂不支持 IPv6 字面量。Claude Code 使用该地址，Codex 自动追加 `/v1`。实际地址只需保留在内部发放的命令中，不要提交到公开仓库。
 

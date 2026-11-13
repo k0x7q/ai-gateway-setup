@@ -10,6 +10,84 @@ $AssetHashes = @{
 @@HASHES@@
 }
 
+function Invoke-GatewayDesktopBootstrap {
+    param([string]$Source, [string]$Product, [string]$GatewayUrl)
+    if ([string]::IsNullOrWhiteSpace($Source)) { throw 'Unable to transfer the in-memory starter to Windows PowerShell.' }
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not [IO.File]::Exists($powershell)) { throw 'Windows PowerShell 5.1 was not found.' }
+    # Only this small, fixed reader goes on the command line. The already-loaded
+    # starter and arguments travel as UTF-8 JSON on stdin, never as interpolated
+    # code, another download, a temporary file or a command-line-sized payload.
+    $reader = @'
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
+try {
+    $packet = ConvertFrom-Json -InputObject ([Console]::In.ReadToEnd())
+    if ($packet.Source -isnot [string] -or [string]::IsNullOrWhiteSpace($packet.Source)) { throw 'Invalid starter payload.' }
+    $arguments = @{ GatewayUrl = $packet.GatewayUrl }
+    if (-not [string]::IsNullOrEmpty($packet.Product)) { $arguments.Product = $packet.Product }
+    & ([scriptblock]::Create($packet.Source)) @arguments | Out-Host
+    if ($null -eq $global:LASTEXITCODE) { exit 0 }
+    exit ([int]$global:LASTEXITCODE)
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+'@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($reader))
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $powershell
+    $start.Arguments = '-NoLogo -NoProfile -NonInteractive -STA -EncodedCommand ' + $encoded
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    # This function runs under PowerShell 7; the worker remains on .NET Framework.
+    $start.StandardInputEncoding = [Text.UTF8Encoding]::new($false)
+    $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $start.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $start
+    $started = $false
+    try {
+        $started = $process.Start()
+        if (-not $started) { throw 'Unable to start Windows PowerShell 5.1.' }
+        $output = $process.StandardOutput.ReadLineAsync()
+        $errors = $process.StandardError.ReadLineAsync()
+        $payload = ConvertTo-Json -InputObject @{ Source = $Source; Product = $Product; GatewayUrl = $GatewayUrl } -Compress
+        $process.StandardInput.Write($payload)
+        $process.StandardInput.Close()
+        # Forward both streams live, without changing the caller's output encoding
+        # or treating a native stderr diagnostic as a terminating PowerShell error.
+        while ($null -ne $output -or $null -ne $errors) {
+            $pending = @()
+            if ($null -ne $output) { $pending += $output }
+            if ($null -ne $errors) { $pending += $errors }
+            [void][Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending)
+            if ($null -ne $output -and $output.IsCompleted) {
+                $line = $output.GetAwaiter().GetResult()
+                if ($null -eq $line) { $output = $null }
+                else { Write-Host $line; $output = $process.StandardOutput.ReadLineAsync() }
+            }
+            if ($null -ne $errors -and $errors.IsCompleted) {
+                $line = $errors.GetAwaiter().GetResult()
+                if ($null -eq $line) { $errors = $null }
+                else { Write-Host $line -ForegroundColor Red; $errors = $process.StandardError.ReadLineAsync() }
+            }
+        }
+        $process.WaitForExit()
+        return [int]$process.ExitCode
+    }
+    finally {
+        try {
+            if ($started -and -not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+        } finally { $process.Dispose() }
+    }
+}
+
 function ConvertTo-GatewayOrigin {
     param([string]$Value = $env:AI_GATEWAY_URL)
     if ([string]::IsNullOrEmpty($Value) -or $Value -cnotmatch '^https://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?/?\z') {
@@ -250,7 +328,8 @@ function Invoke-GatewayBootstrap {
         [ValidateSet('claude', 'codex', '')][string]$Product = '',
         [string]$Version,
         [hashtable]$Hashes,
-        [string]$GatewayUrl = $env:AI_GATEWAY_URL
+        [string]$GatewayUrl = $env:AI_GATEWAY_URL,
+        [string]$Source
     )
     $oldTls = [Net.ServicePointManager]::SecurityProtocol
     $oldProgress = $ProgressPreference
@@ -261,9 +340,15 @@ function Invoke-GatewayBootstrap {
     $childEnded = $false
     try {
         if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
-            $PSVersionTable.PSVersion -lt [version]'5.1' -or $PSVersionTable.PSEdition -ne 'Desktop') {
-            throw 'Use Windows PowerShell 5.1 (Desktop) on Windows; PowerShell Core/7 is not supported.'
+            $PSVersionTable.PSVersion -lt [version]'5.1') {
+            throw 'Use Windows PowerShell 5.1 or PowerShell 7 on Windows 10/11.'
         }
+        if ($PSVersionTable.PSEdition -eq 'Core' -and $PSVersionTable.PSVersion.Major -ge 7) {
+            # Same account, privilege token and environment; never use RunAs or
+            # select another Windows user's profile. Staging happens only in 5.1.
+            return (Invoke-GatewayDesktopBootstrap -Source $Source -Product $Product -GatewayUrl $GatewayUrl)
+        }
+        if ($PSVersionTable.PSEdition -ne 'Desktop') { throw 'Unsupported PowerShell runtime.' }
         if ([string]::IsNullOrEmpty($Product)) { $Product = Read-GatewayProduct }
         if ([string]::IsNullOrEmpty($Product)) {
             Write-Host 'Cancelled. No setup files were downloaded.'
@@ -328,7 +413,7 @@ function Invoke-GatewayBootstrap {
     return [int]$exitCode
 }
 
-$bootstrapExit = Invoke-GatewayBootstrap -Product $Product -Version $ReleaseVersion -Hashes $AssetHashes -GatewayUrl $GatewayUrl
+$bootstrapExit = Invoke-GatewayBootstrap -Product $Product -Version $ReleaseVersion -Hashes $AssetHashes -GatewayUrl $GatewayUrl -Source $MyInvocation.MyCommand.ScriptBlock.ToString()
 if ($MyInvocation.MyCommand -is [Management.Automation.ExternalScriptInfo] -and $MyInvocation.InvocationName -ne '.') {
     # A real -File invocation owns its process exit code.
     exit $bootstrapExit

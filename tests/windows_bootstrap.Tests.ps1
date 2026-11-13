@@ -37,7 +37,7 @@ $definitions = @($ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $false))
 foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
-Assert-True ($definitions.Count -eq 9) 'Expected standalone function contract, including isolated product dialog.'
+Assert-True ($definitions.Count -eq 10) 'Expected standalone function contract, including isolated product dialog and Core relay.'
 $realRemove = ${function:Remove-GatewayPrivateDirectory}
 $realRead = ${function:Read-GatewayProduct}
 $realNew = ${function:New-GatewayPrivateDirectory}
@@ -120,7 +120,7 @@ try {
         Assert-True ($exitNodes.Count -eq 1 -and $exitNodes[0].Parent.Parent -is [Management.Automation.Language.IfStatementAst]) 'Process exit must be guarded, never unconditional.'
         Assert-True ($exitNodes[0].Parent.Parent.Extent.Text.Contains('[Management.Automation.ExternalScriptInfo]')) 'Only real script-file invocation may exit.'
         function Invoke-GatewayBootstrap {
-            param([string]$Product, [string]$Version, [hashtable]$Hashes, [string]$GatewayUrl)
+            param([string]$Product, [string]$Version, [hashtable]$Hashes, [string]$GatewayUrl, [string]$Source)
             return 37
         }
         $oldExit = $global:LASTEXITCODE
@@ -137,11 +137,42 @@ try {
         $bootstrapDefinition = @($definitions | Where-Object { $_.Name -eq 'Invoke-GatewayBootstrap' })[0]
         $fixtureSource = $bootstrapDefinition.Extent.Text.Replace('$PSVersionTable', '$script:fakeVersionTable')
         . ([scriptblock]::Create($fixtureSource))
-        $script:fakeVersionTable = @{ PSVersion = [version]'7.4'; PSEdition = 'Core' }
-        Assert-True ((Invoke-GatewayBootstrap -Product codex -Version v1.2.3 -Hashes $hashes) -eq 1) 'Reject PowerShell Core.'
+        $script:fakeVersionTable = @{ PSVersion = [version]'6.2'; PSEdition = 'Core' }
+        Assert-True ((Invoke-GatewayBootstrap -Product codex -Version v1.2.3 -Hashes $hashes) -eq 1) 'Reject obsolete PowerShell Core.'
         $script:fakeVersionTable = @{ PSVersion = [version]'5.0'; PSEdition = 'Desktop' }
         Assert-True ((Invoke-GatewayBootstrap -Product codex -Version v1.2.3 -Hashes $hashes) -eq 1) 'Reject older Windows PowerShell.'
         Assert-True ($null -eq $script:lastDirectory -and $script:downloaded.Count -eq 0 -and $script:executed -eq 0) 'Unsupported runtime is side-effect free.'
+    }
+    Test-Case 'PowerShell 7 relays before staging and preserves caller state' {
+        Reset-Mocks
+        $bootstrapDefinition = @($definitions | Where-Object { $_.Name -eq 'Invoke-GatewayBootstrap' })[0]
+        . ([scriptblock]::Create($bootstrapDefinition.Extent.Text.Replace('$PSVersionTable', '$script:fakeVersionTable')))
+        $script:fakeVersionTable = @{ PSVersion = [version]'7.4'; PSEdition = 'Core' }
+        function Invoke-GatewayDesktopBootstrap {
+            param([string]$Source, [string]$Product, [string]$GatewayUrl)
+            Assert-True ($Source -ceq 'mock-loaded-source') 'Relay uses supplied source, not another download.'
+            Assert-True ($Product -ceq 'codex' -and $GatewayUrl -ceq 'https://other.example.com:8443/') 'Parameters remain data.'
+            return 29
+        }
+        $tls = [Net.ServicePointManager]::SecurityProtocol
+        $progress = $ProgressPreference
+        $gateway = $env:AI_GATEWAY_URL
+        $result = Invoke-GatewayBootstrap -Product codex -Version v1.2.3 -Hashes $hashes -Source 'mock-loaded-source' -GatewayUrl 'https://other.example.com:8443/'
+        Assert-True ($result -eq 29) 'Preserve relay exit status.'
+        Assert-True ($null -eq $script:lastDirectory -and $script:downloaded.Count -eq 0 -and $script:executed -eq 0) 'No staging or helpers in Core caller.'
+        Assert-True ([Net.ServicePointManager]::SecurityProtocol -eq $tls -and $ProgressPreference -eq $progress -and $env:AI_GATEWAY_URL -ceq $gateway) 'Caller settings unchanged.'
+    }
+    Test-Case 'Relay failure stops without staging or silently selecting a product' {
+        Reset-Mocks
+        $bootstrapDefinition = @($definitions | Where-Object { $_.Name -eq 'Invoke-GatewayBootstrap' })[0]
+        . ([scriptblock]::Create($bootstrapDefinition.Extent.Text.Replace('$PSVersionTable', '$script:fakeVersionTable')))
+        $script:fakeVersionTable = @{ PSVersion = [version]'7.4'; PSEdition = 'Core' }
+        function Invoke-GatewayDesktopBootstrap { throw 'Mock relay launch failure.' }
+        $result = Invoke-GatewayBootstrap -Version v1.2.3 -Hashes $hashes -Source 'mock-loaded-source'
+        Assert-True ($result -eq 1 -and $null -eq $script:lastDirectory -and $script:downloaded.Count -eq 0 -and $script:executed -eq 0) 'Failed relay has no staging or fallback.'
+        $relay = @($definitions | Where-Object { $_.Name -eq 'Invoke-GatewayDesktopBootstrap' })[0].Extent.Text
+        Assert-True ($relay.Contains('$start.UseShellExecute = $false') -and $relay.Contains('-NoProfile') -and $relay.Contains('-STA')) 'Relay inherits current account, privilege and environment.'
+        Assert-True (-not $relay.Contains('-Verb RunAs')) 'Do not switch accounts or elevate the whole starter.'
     }
     Test-Case 'Claude selection, byte preservation, exit and cleanup' {
         Reset-Mocks

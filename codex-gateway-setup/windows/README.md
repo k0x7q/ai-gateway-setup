@@ -1,6 +1,6 @@
 # Windows：Codex 网关设置
 
-推荐使用[项目首页](<../../README.md>)中的在线启动命令。使用 Windows 10/11 自带的 Windows PowerShell 5.1 和 WinForms，不安装 PowerShell 7、Python 或其他软件。启动器只为本次 PowerShell 进程使用 ExecutionPolicy Bypass，不更改系统策略。
+推荐使用[项目首页](<../../README.md>)中的在线启动命令。支持从 Windows PowerShell 5.1 或 PowerShell 7 启动，普通权限、管理员权限均可；PowerShell 7 自动转接到 Windows 10/11 自带的 Windows PowerShell 5.1 和 WinForms，无需安装额外运行时。配置按运行脚本的当前账号及环境变量定位，不扫描其他用户。启动器只为本次 PowerShell 进程使用 ExecutionPolicy Bypass，不更改系统策略。
 
 离线运行时，保持启动文件和“辅助文件”文件夹在一起，在 PowerShell 中传入地址并运行[启动文件](<双击此文件配置 Codex.cmd>)：
 
