@@ -70,6 +70,26 @@ test('prepared existing save backs up exact bytes and keeps conflict warnings', 
   assert.deepEqual(fs.readFileSync(result.backup), original);
   assert.equal(core.loadSettings(target).settings.model, 'personal');
 });
+test('prepared launcher preserves existing model choices while filling missing defaults', async t => {
+  const { target } = fixture(t); fs.mkdirSync(path.dirname(target));
+  const settings = { model: 'personal-top-level', env: {
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'personal-haiku',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'personal-sonnet',
+    ANTHROPIC_MODEL: 'personal-main',
+    CLAUDE_CODE_SUBAGENT_MODEL: 'personal-agent',
+  } };
+  const original = Buffer.from(JSON.stringify(settings));
+  fs.writeFileSync(target, original);
+  const result = await core.preparedMain(request(target, core.digest(original)));
+  assert.equal(result.ok, true); noKey(result);
+  assert.deepEqual(fs.readFileSync(result.backup), original);
+  const saved = core.loadSettings(target).settings;
+  assert.equal(saved.model, settings.model);
+  for (const [key, value] of Object.entries(settings.env)) assert.equal(saved.env[key], value);
+  assert.equal(saved.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'claude-sonnet-5-5');
+  assert.equal(saved.env.ANTHROPIC_DEFAULT_FABLE_MODEL, 'claude-sonnet-5-5');
+  assert.equal(saved.env.ANTHROPIC_AUTH_TOKEN, KEY);
+});
 test('preflight snapshot mismatch refuses to overwrite or create backup', async t => {
   const { target } = fixture(t); fs.mkdirSync(path.dirname(target)); fs.writeFileSync(target, '{"changed":true}');
   const result = await core.preparedMain(request(target, core.digest(Buffer.from('{}'))));

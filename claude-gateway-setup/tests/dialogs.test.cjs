@@ -44,8 +44,10 @@ test('quiet configuration hides routine output and still saves defaults with exa
   assert.deepEqual(fs.readFileSync(result.backup), before);
   const env = core.loadSettings(target).settings.env;
   assert.equal(env.ANTHROPIC_AUTH_TOKEN, NEW);
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5');
-  assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, 'claude-haiku-5-5');
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-sonnet-5-5');
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'claude-haiku-5-5');
+  assert.equal(Object.hasOwn(env, 'ANTHROPIC_MODEL'), false);
+  assert.equal(Object.hasOwn(env, 'CLAUDE_CODE_SUBAGENT_MODEL'), false);
   assert.ok(logs.output.every(text => text.startsWith('注意：'))); logs.safe();
 });
 test('quiet cancellation still rejects without changing the original configuration', async t => {

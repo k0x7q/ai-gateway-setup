@@ -98,7 +98,11 @@ class DistributionTests(unittest.TestCase):
         target = self.home / '.claude/settings.json'
         settings = json.loads(target.read_text())
         self.assertEqual(settings['env']['ANTHROPIC_AUTH_TOKEN'], KEY)
-        self.assertEqual(settings['env']['ANTHROPIC_MODEL'], 'claude-sonnet-5')
+        self.assertEqual(settings['env']['ANTHROPIC_DEFAULT_HAIKU_MODEL'], 'claude-haiku-5-5')
+        for key in ('ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_FABLE_MODEL'):
+            self.assertEqual(settings['env'][key], 'claude-sonnet-5-5')
+        self.assertNotIn('ANTHROPIC_MODEL', settings['env'])
+        self.assertNotIn('CLAUDE_CODE_SUBAGENT_MODEL', settings['env'])
         self.assertIn('未验证网关密钥或模型', first.stdout)
         self.assertIn('配置完成。请在项目目录打开新终端，运行 claude。', first.stdout)
         original = {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}

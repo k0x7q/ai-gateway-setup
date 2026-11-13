@@ -7,11 +7,12 @@ const crypto = require('node:crypto');
 const readline = require('node:readline');
 const { spawnSync } = require('node:child_process');
 const { createDialogs, DialogError, validToken } = require('./dialogs.cjs');
-const MODEL = 'claude-sonnet-5';
-const SUBAGENT_MODEL = 'claude-haiku-5-5';
-const MODEL_KEYS = ['ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_FABLE_MODEL'];
+const DEFAULT_MODELS = Object.freeze({
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-5-5',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-sonnet-5-5',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5-5',
+  ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-sonnet-5-5',
+});
 const MAX_BYTES = 2 * 1024 * 1024;
 class SetupError extends Error {
   constructor(message, details = {}) { super(message); this.name = 'SetupError'; Object.assign(this, details); }
@@ -107,8 +108,10 @@ function mergeSettings(settings, token) {
     throw new SetupError('网关密钥为空、含空白或控制字符，或者过长，请重新输入。');
   }
   const env = { ...(settings.env || {}), ANTHROPIC_BASE_URL: BASE_URL, ANTHROPIC_AUTH_TOKEN: token };
-  for (const key of MODEL_KEYS) env[key] = MODEL;
-  env.CLAUDE_CODE_SUBAGENT_MODEL = SUBAGENT_MODEL;
+  // Fill missing defaults only; explicit user choices (including legacy overrides) survive.
+  for (const [key, model] of Object.entries(DEFAULT_MODELS)) {
+    if (!Object.hasOwn(env, key)) env[key] = model;
+  }
   return { ...settings, env };
 }
 function configPath(environment = process.env, home = os.homedir()) {
@@ -378,4 +381,4 @@ if (require.main === module) {
     });
   }
 }
-module.exports = { gatewayUrl, MODEL, MODEL_KEYS, SetupError, parseSettings, mergeSettings, configPath, loadSettings, saveSettings, main, digest, preparedMain, readPreparedInput, errorDiagnostic, redactDiagnostic };
+module.exports = { gatewayUrl, DEFAULT_MODELS, SetupError, parseSettings, mergeSettings, configPath, loadSettings, saveSettings, main, digest, preparedMain, readPreparedInput, errorDiagnostic, redactDiagnostic };

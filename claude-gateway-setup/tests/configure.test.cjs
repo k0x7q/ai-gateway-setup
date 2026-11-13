@@ -22,8 +22,56 @@ test('default models match configured model defaults and base URL has no /v1', (
   const result = core.mergeSettings({}, fakeKey);
   assert.equal(result.env.ANTHROPIC_BASE_URL, 'https://gateway.example.com');
   assert.equal(result.env.ANTHROPIC_AUTH_TOKEN, fakeKey);
-  for (const key of core.MODEL_KEYS) assert.equal(result.env[key], 'claude-sonnet-5');
-  assert.equal(result.env.CLAUDE_CODE_SUBAGENT_MODEL, 'claude-haiku-5-5');
+  assert.deepEqual(result.env, {
+    ANTHROPIC_BASE_URL: 'https://gateway.example.com',
+    ANTHROPIC_AUTH_TOKEN: fakeKey,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-5-5',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-sonnet-5-5',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5-5',
+    ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-sonnet-5-5',
+  });
+});
+test('existing model choices and legacy global/subagent overrides are preserved', () => {
+  const models = {
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'personal-haiku',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'personal-opus',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'personal-sonnet',
+    ANTHROPIC_DEFAULT_FABLE_MODEL: 'personal-fable',
+    ANTHROPIC_MODEL: 'personal-main',
+    CLAUDE_CODE_SUBAGENT_MODEL: 'personal-agent',
+  };
+  const original = { model: 'personal-top-level', env: { ...models, ANTHROPIC_BASE_URL: 'https://old.example.com', ANTHROPIC_AUTH_TOKEN: 'old-fake-key' } };
+  const snapshot = JSON.stringify(original);
+  const result = core.mergeSettings(original, fakeKey);
+  for (const [key, model] of Object.entries(models)) assert.equal(result.env[key], model);
+  assert.equal(result.model, original.model);
+  assert.equal(result.env.ANTHROPIC_BASE_URL, 'https://gateway.example.com');
+  assert.equal(result.env.ANTHROPIC_AUTH_TOKEN, fakeKey);
+  assert.equal(JSON.stringify(original), snapshot);
+});
+test('partial existing model configuration fills only missing fields', () => {
+  const result = core.mergeSettings({ env: { ANTHROPIC_DEFAULT_SONNET_MODEL: 'personal-sonnet' } }, fakeKey);
+  assert.equal(result.env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'personal-sonnet');
+  assert.equal(result.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'claude-haiku-5-5');
+  assert.equal(result.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'claude-sonnet-5-5');
+  assert.equal(result.env.ANTHROPIC_DEFAULT_FABLE_MODEL, 'claude-sonnet-5-5');
+  assert.equal(Object.hasOwn(result.env, 'ANTHROPIC_MODEL'), false);
+  assert.equal(Object.hasOwn(result.env, 'CLAUDE_CODE_SUBAGENT_MODEL'), false);
+});
+test('existing empty or non-string model fields are not silently replaced', () => {
+  const env = { ANTHROPIC_DEFAULT_HAIKU_MODEL: '', ANTHROPIC_DEFAULT_OPUS_MODEL: null,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: false, ANTHROPIC_DEFAULT_FABLE_MODEL: 0 };
+  const result = core.mergeSettings({ env }, fakeKey);
+  for (const key of Object.keys(env)) assert.equal(result.env[key], env[key]);
+});
+test('legacy sonnet-only defaults survive repeated configuration unchanged', () => {
+  const env = Object.fromEntries(Object.keys(core.DEFAULT_MODELS).map(key => [key, 'claude-sonnet-5']));
+  env.ANTHROPIC_MODEL = 'claude-sonnet-5';
+  env.CLAUDE_CODE_SUBAGENT_MODEL = 'claude-haiku-5-5';
+  const first = core.mergeSettings({ env }, fakeKey);
+  const second = core.mergeSettings(first, fakeKey);
+  assert.deepEqual(second, first);
+  for (const key of Object.keys(env)) assert.equal(second.env[key], env[key]);
 });
 test('gateway URL is supplied at runtime and normalizes origin and port', () => {
   assert.equal(core.gatewayUrl('https://OTHER.example.com:8443/'), 'https://other.example.com:8443');
