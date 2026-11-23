@@ -169,6 +169,31 @@ Assert-True ($out.Contains('extra = "untouched # text"')) 'Unrelated value chang
 Assert-True ($out.Contains('# provider comment')) 'Target comment lost'
 Assert-True ($out.Contains('notify = ["C:\\example\\notify.cmd", "turn-ended"]')) 'String array changed'
 Assert-True ($out.Contains('args = []')) 'Empty array changed'
+$desktopNotify=@'
+notify = [ # Desktop-managed notification hook
+    "C:\\Program Files\\WindowsApps\\Codex\\node.exe",
+    # The next argument includes brackets and a hash.
+    "C:\\notify\\handler[1]#test.js",
+    'turn-ended']
+'@
+$desktopFixture=@"
+model = "existing-model"
+model_provider = "openai"
+$desktopNotify # closing comment
+[plugins."codex-app-tools@openai-bundled"]
+enabled = true
+[shell_environment_policy]
+inherit = "core"
+"@
+$desktopFixture=$desktopFixture -replace '\r?\n',"`r`n"
+$desktopOut=Build-Config (Read-SafeToml $desktopFixture) 'synthetic'
+$expectedNotify=($desktopNotify -replace '\r?\n',"`r`n")+' # closing comment'
+Assert-True ($desktopOut.Contains($expectedNotify)) 'Desktop notification array or its comments changed'
+Assert-True ($desktopOut.Contains('[shell_environment_policy]')) 'Table after desktop array was not preserved'
+Assert-True ($desktopOut -match '(?m)^model_provider = "custom"\r?$') 'Desktop config did not switch provider'
+$managedArray="model_provider = [ # provider note`n  'old',`n]`n"
+$managedOut=Build-Config (Read-SafeToml $managedArray) 'synthetic'
+Assert-True ($managedOut.Contains('# provider note') -and -not $managedOut.Contains("'old'")) 'Replacing a managed array left old elements behind'
 Assert-True ((Build-Config (Read-SafeToml '') 'synthetic') -match 'model = "gpt-6.1-sol"') 'Default model missing'
 foreach ($url in @('https://gateway.example.com.attacker.test/v1','https://gateway.example.com/v1?x=1','http://gateway.example.com/v1','https://gateway.example.com/foo/../v1','https://gateway.example.com/V1','https://gateway.example.com:444/v1')) {
     $inputText="[model_providers.custom]`nbase_url = `"$url`"`nexperimental_bearer_token = `"synthetic`""
@@ -181,6 +206,10 @@ Assert-Reject "a = 1`n[a.b]"
 Assert-Reject 'x = [1, 2]'
 Assert-Reject 'x = ["a" "b"]'
 Assert-Reject 'x = ["a",, "b"]'
+Assert-Reject "notify = [`n 'missing-close',"
+Assert-Reject "notify = [`n 'first'`n 'missing-comma'`n]"
+Assert-Reject "notify = [`n [shell_environment_policy]`ninherit = 'core'"
+Assert-Reject "notify = [`n 'valid',`n]`nnotify = []"
 Assert-Reject 'model = false'
 Assert-Reject 'x = TRUE'
 Assert-Reject 'x = "\N"'
@@ -218,16 +247,17 @@ $parentAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::n
 [IO.Directory]::SetAccessControl($configDir,$parentAcl)
 $path=Join-Path $configDir 'config.toml'
 $utf8=New-Object System.Text.UTF8Encoding($false,$true)
-$initial=$utf8.GetBytes('model = "test"')
+$initial=$utf8.GetBytes($desktopFixture)
 [IO.File]::WriteAllBytes($path,$initial)
 $oldAcl=[IO.File]::GetAccessControl($path)
 $oldRules=$oldAcl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])
 Assert-True (-not $oldAcl.AreAccessRulesProtected) 'Existing-config fixture must inherit permissions'
 Assert-True (@($oldRules | Where-Object { $_.IsInherited -and $_.IdentityReference.Equals($otherSid) }).Count -gt 0) 'Existing-config fixture must inherit a rule for another principal'
 $savedState=New-SaveState
-Save-ConfigAtomic $path $initial $true (Build-Config (Read-SafeToml 'model = "test"') 'synthetic') $savedState
+Save-ConfigAtomic $path $initial $true (Build-Config (Read-SafeToml ($utf8.GetString($initial))) 'synthetic') $savedState
 Assert-True ($savedState.Started -and $savedState.BackupCreated -and $savedState.PermissionsMayHaveChanged -and $savedState.ReplacementAttempted -and $savedState.ContentSaved) 'Successful save state was not tracked'
 Assert-True ((Get-ExistingKey (Read-SafeToml ([IO.File]::ReadAllText($path)))) -ceq 'synthetic') 'Save failed'
+Assert-True ([IO.File]::ReadAllText($path).Contains($expectedNotify)) 'Saved config lost its desktop notification block'
 $backups=@(Get-ChildItem -LiteralPath $configDir -Filter 'config.toml.backup-*')
 Assert-True ($backups.Count -eq 1) 'Missing backup'
 Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($backups[0].FullName)) -ceq [Convert]::ToBase64String($initial)) 'Backup differs'

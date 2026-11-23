@@ -218,6 +218,10 @@ function Split-TomlComment([string]$Line) {
     if ($quote -ne [char]0) { throw 'Unclosed or multiline string' }
     return $Line.TrimEnd([char[]]@(' ',[char]9))
 }
+function Get-TomlLineCode([string]$Line) {
+    if ($Line -match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]') { throw 'Invalid control character' }
+    return (Split-TomlComment $Line)
+}
 function Test-TomlStringArray([string]$Value) {
     if ($Value.Length -lt 2 -or $Value[0] -ne '[' -or $Value[$Value.Length-1] -ne ']') { throw 'Unsupported TOML array' }
     $inner=$Value.Substring(1,$Value.Length-2); $i=0; $count=$inner.Length
@@ -260,12 +264,11 @@ function Read-SafeToml([string]$Text) {
     $entries = New-Object System.Collections.ArrayList
     $section = ''
     $partPattern = '(?:[A-Za-z0-9_-]+|"(?:[^"\\\x00-\x1F]|\\(?:["\\btnfr]|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}))*"|''[^''\x00-\x1F]*'')'
-    $lineNumber=0
-    foreach ($line in $lines) {
-        $lineNumber++
+    for ($lineIndex=0; $lineIndex -lt $lines.Count; $lineIndex++) {
+        $lineNumber=$lineIndex+1
+        $line=$lines[$lineIndex]
         try {
-        if ($line -match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]') { throw 'Invalid control character' }
-        $code = Split-TomlComment $line
+        $code = Get-TomlLineCode $line
         if ($code -match '^[ \t]*$') { [void]$entries.Add([pscustomobject]@{ Line=$line; Section=$section; Kind='other'; Key=''; Value=$null }); continue }
         if ($code -match '^[ \t]*\[(.*?)\][ \t]*$') {
             $header=$Matches[1]; $remainder=$header; $section=''
@@ -286,12 +289,30 @@ function Read-SafeToml([string]$Text) {
         if ($code -notmatch '^[ \t]*([A-Za-z0-9_-]+)[ \t]*=[ \t]*(.*?)[ \t]*$') { throw 'Unsupported TOML syntax' }
         $key=$Matches[1]; $value=$Matches[2]; $identity=$section+'/'+(Get-TomlPathPart $key)
         if (-not $seen.Add($identity) -or $nodes.Contains($identity)) { throw 'Duplicate key or table conflict' }
+        $comment=$line.Substring($code.Length).TrimStart([char[]]@(' ',[char]9))
         $decoded=$null
         if ($value.StartsWith('"') -or $value.StartsWith("'")) { $decoded=Decode-TomlString $value }
-        elseif ($value.StartsWith('[')) { Test-TomlStringArray $value }
+        elseif ($value.StartsWith('[')) {
+            $startIndex=$lineIndex
+            if (-not $value.EndsWith(']')) {
+                $arrayCode=[Text.StringBuilder]::new($value)
+                do {
+                    $lineIndex++
+                    if ($lineIndex -ge $lines.Count) { throw 'Unsupported TOML array' }
+                    $lineNumber=$lineIndex+1
+                    $partCode=Get-TomlLineCode $lines[$lineIndex]
+                    # Keep token separation when validating; preserve the physical lines for output.
+                    [void]$arrayCode.Append(' ').Append($partCode)
+                } until ($partCode.EndsWith(']'))
+                $value=$arrayCode.ToString()
+                $line=[string]::Join($newline,$lines,$startIndex,$lineIndex-$startIndex+1)
+            }
+            $lineNumber=$startIndex+1
+            Test-TomlStringArray $value
+        }
         elseif ($value -cnotmatch '^(?:true|false|[+-]?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|[+-]?(?:inf|nan))$') { throw 'Unsupported TOML value' }
         if ($section -ceq '' -and $key -ceq 'model' -and $null -eq $decoded) { throw 'Model must be a string' }
-        [void]$entries.Add([pscustomobject]@{ Line=$line; Section=$section; Kind='key'; Key=$key; Value=$decoded })
+        [void]$entries.Add([pscustomobject]@{ Line=$line; Section=$section; Kind='key'; Key=$key; Value=$decoded; Comment=$comment })
         } catch {
             # Carry only line number. Do not attach line text or the ErrorRecord.
             $_.Exception.Data['TomlLine']=$lineNumber
@@ -331,9 +352,7 @@ function Build-Config($Parsed,[string]$Key) {
             if ($e.Section -ceq $script:CustomSection) { $hasCustom=$true; $customOpen=$true }
         }
         if ($e.Kind -eq 'key' -and (($e.Section -ceq '' -and $e.Key -ceq 'model_provider') -or ($e.Section -ceq $script:CustomSection -and $fields -ccontains $e.Key))) {
-            $code=Split-TomlComment $e.Line
-            $tail=$e.Line.Substring($code.Length).TrimStart([char[]]@(' ',[char]9))
-            if ($tail.StartsWith('#')) { $output.Add($tail) }
+            if ($e.Comment.StartsWith('#')) { $output.Add($e.Comment) }
             continue
         }
         $output.Add($e.Line)
