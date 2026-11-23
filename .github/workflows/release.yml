@@ -53,8 +53,9 @@ jobs:
         run: '& ./tests/windows_bootstrap.Tests.ps1'
 
       - name: Test Windows Codex config core and file saves
+        working-directory: codex-gateway-setup/windows/辅助文件
         shell: powershell
-        run: "& './codex-gateway-setup/windows/辅助文件/SelfTest.ps1'"
+        run: '& ./SelfTest.ps1'
 
       - name: Test PowerShell 7 entry and real Windows PowerShell relay
         shell: pwsh
