@@ -48,13 +48,13 @@ jobs:
           python-version: '3.12'
       - name: Build release assets
         run: python tools/build_release.py
-      - name: Test Windows starter and original Codex config core
+      - name: Test Windows starter
         shell: powershell
-        run: |
-          & ./tests/windows_bootstrap.Tests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & './codex-gateway-setup/windows/辅助文件/SelfTest.ps1'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: '& ./tests/windows_bootstrap.Tests.ps1'
+
+      - name: Test Windows Codex config core and file saves
+        shell: powershell
+        run: "& './codex-gateway-setup/windows/辅助文件/SelfTest.ps1'"
 
       - name: Test PowerShell 7 entry and real Windows PowerShell relay
         shell: pwsh

@@ -363,7 +363,7 @@ function New-PrivateFile([string]$Path,[byte[]]$Bytes) {
     $acl.SetOwner($sid)
     $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow')
     [void]$acl.AddAccessRule($rule)
-    $stream=New-Object System.IO.FileStream($Path,[System.IO.FileMode]::CreateNew,[System.IO.FileSystemRights]::Write,[System.IO.FileShare]::None,4096,[System.IO.FileOptions]::WriteThrough,$acl)
+    $stream=New-Object System.IO.FileStream($Path,[System.IO.FileMode]::CreateNew,[System.Security.AccessControl.FileSystemRights]::Write,[System.IO.FileShare]::None,4096,[System.IO.FileOptions]::WriteThrough,$acl)
     try { $stream.Write($Bytes,0,$Bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
 }
 function Save-ConfigAtomic([string]$Path,[byte[]]$Original,[bool]$Existed,[string]$Text,$State=$null) {
