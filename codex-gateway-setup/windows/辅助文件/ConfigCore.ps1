@@ -396,7 +396,8 @@ function Save-ConfigAtomic([string]$Path,[byte[]]$Original,[bool]$Existed,[strin
             if ([Convert]::ToBase64String($Original) -cne [Convert]::ToBase64String($current)) { throw 'Configuration changed during setup' }
             Assert-NoReparseAncestors $dir
             $State.ReplacementAttempted=$true
-            [IO.File]::Replace($temp,$Path,$null,$true)
+            # PowerShell 5.1 converts a bare null to an empty string for this .NET parameter.
+            [IO.File]::Replace($temp,$Path,[NullString]::Value,$true)
             $State.ContentSaved=$true
         } else {
             Assert-NoReparseAncestors $dir
