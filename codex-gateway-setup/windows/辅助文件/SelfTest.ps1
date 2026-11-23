@@ -206,17 +206,38 @@ if ($junctionCreated) {
     Assert-True $rejected 'Save through junction was not rejected'
     Assert-True (-not [IO.File]::Exists((Join-Path (Join-Path $target 'child') 'config.toml'))) 'Config was written through junction'
 }
-$path=Join-Path $dir 'config.toml'
+# Existing Codex files normally inherit permissions. A private fixture masks failed ACL writes.
+$configDir=Join-Path $dir 'existing-config'
+[void][IO.Directory]::CreateDirectory($configDir)
+$otherSid=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+$parentAcl=[IO.Directory]::GetAccessControl($configDir)
+$parentAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+    $otherSid,[System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+    [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+    [System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow))
+[IO.Directory]::SetAccessControl($configDir,$parentAcl)
+$path=Join-Path $configDir 'config.toml'
 $utf8=New-Object System.Text.UTF8Encoding($false,$true)
 $initial=$utf8.GetBytes('model = "test"')
-New-PrivateFile $path $initial
+[IO.File]::WriteAllBytes($path,$initial)
+$oldAcl=[IO.File]::GetAccessControl($path)
+$oldRules=$oldAcl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])
+Assert-True (-not $oldAcl.AreAccessRulesProtected) 'Existing-config fixture must inherit permissions'
+Assert-True (@($oldRules | Where-Object { $_.IsInherited -and $_.IdentityReference.Equals($otherSid) }).Count -gt 0) 'Existing-config fixture must inherit a rule for another principal'
 $savedState=New-SaveState
 Save-ConfigAtomic $path $initial $true (Build-Config (Read-SafeToml 'model = "test"') 'synthetic') $savedState
 Assert-True ($savedState.Started -and $savedState.BackupCreated -and $savedState.PermissionsMayHaveChanged -and $savedState.ReplacementAttempted -and $savedState.ContentSaved) 'Successful save state was not tracked'
 Assert-True ((Get-ExistingKey (Read-SafeToml ([IO.File]::ReadAllText($path)))) -ceq 'synthetic') 'Save failed'
-$backups=@(Get-ChildItem -LiteralPath $dir -Filter 'config.toml.backup-*')
+$backups=@(Get-ChildItem -LiteralPath $configDir -Filter 'config.toml.backup-*')
 Assert-True ($backups.Count -eq 1) 'Missing backup'
 Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($backups[0].FullName)) -ceq [Convert]::ToBase64String($initial)) 'Backup differs'
+$ownerSid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User
+foreach ($savedPath in @($path,$backups[0].FullName)) {
+    $savedAcl=[IO.File]::GetAccessControl($savedPath)
+    $savedRules=$savedAcl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])
+    Assert-True ($savedAcl.AreAccessRulesProtected -and $savedAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Equals($ownerSid)) 'Config and backup must be private and owned by the current user'
+    Assert-True ($savedRules.Count -eq 1 -and $savedRules[0].IdentityReference.Equals($ownerSid) -and -not $savedRules[0].IsInherited -and $savedRules[0].AccessControlType -eq 'Allow' -and $savedRules[0].FileSystemRights -eq 'FullControl') 'Config and backup must grant access only to the current user'
+}
 $conflictState=New-SaveState
 $conflict=$false; try { Save-ConfigAtomic $path $initial $true 'different' $conflictState } catch { $conflict=$true }
 Assert-True $conflict 'Concurrent change was not detected'

@@ -366,6 +366,21 @@ function New-PrivateFile([string]$Path,[byte[]]$Bytes) {
     $stream=New-Object System.IO.FileStream($Path,[System.IO.FileMode]::CreateNew,[System.Security.AccessControl.FileSystemRights]::Write,[System.IO.FileShare]::None,4096,[System.IO.FileOptions]::WriteThrough,$acl)
     try { $stream.Write($Bytes,0,$Bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
 }
+function Assert-PrivateFileAcl([string]$Path,[System.Security.AccessControl.FileSecurity]$Expected) {
+    $actual=[IO.File]::GetAccessControl($Path)
+    if (-not $actual.AreAccessRulesProtected) { throw 'Could not verify private configuration ACL' }
+    $expectedDescriptor=[System.Security.AccessControl.RawSecurityDescriptor]::new($Expected.GetSecurityDescriptorBinaryForm(),0)
+    $actualDescriptor=[System.Security.AccessControl.RawSecurityDescriptor]::new($actual.GetSecurityDescriptorBinaryForm(),0)
+    $expectedRules=$expectedDescriptor.DiscretionaryAcl
+    $actualRules=$actualDescriptor.DiscretionaryAcl
+    # Windows can normalize descriptor metadata. Require the same owner and every actual access entry.
+    if (-not $expectedDescriptor.Owner.Equals($actualDescriptor.Owner) -or $null -eq $actualRules -or $actualRules.Count -ne $expectedRules.Count) {
+        throw 'Could not verify private configuration ACL'
+    }
+    for ($i=0; $i -lt $expectedRules.Count; $i++) {
+        if (-not $expectedRules[$i].Equals($actualRules[$i])) { throw 'Could not verify private configuration ACL' }
+    }
+}
 function Save-ConfigAtomic([string]$Path,[byte[]]$Original,[bool]$Existed,[string]$Text,$State=$null) {
     if ($null -eq $State) { $State=New-SaveState }
     $State.Started=$true
@@ -386,12 +401,13 @@ function Save-ConfigAtomic([string]$Path,[byte[]]$Original,[bool]$Existed,[strin
             $current=[IO.File]::ReadAllBytes($Path)
             if ([Convert]::ToBase64String($Original) -cne [Convert]::ToBase64String($current)) { throw 'Configuration changed during setup' }
             # ReplaceFile can retain the destination ACL. Tighten and verify it before exposing new bytes.
-            $State.PermissionsMayHaveChanged=$true
-            [IO.File]::SetAccessControl($Path,$privateAcl)
             $sections=[System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
-            $expectedAcl=$privateAcl.GetSecurityDescriptorSddlForm($sections)
-            $actualAcl=([IO.File]::GetAccessControl($Path)).GetSecurityDescriptorSddlForm($sections)
-            if ($expectedAcl -cne $actualAcl) { throw 'Could not verify private configuration ACL' }
+            # A descriptor returned by GetAccessControl has no marked changes, so writing it directly does nothing.
+            $replacementAcl=[System.Security.AccessControl.FileSecurity]::new()
+            $replacementAcl.SetSecurityDescriptorBinaryForm($privateAcl.GetSecurityDescriptorBinaryForm(),$sections)
+            $State.PermissionsMayHaveChanged=$true
+            [IO.File]::SetAccessControl($Path,$replacementAcl)
+            Assert-PrivateFileAcl $Path $privateAcl
             $current=[IO.File]::ReadAllBytes($Path)
             if ([Convert]::ToBase64String($Original) -cne [Convert]::ToBase64String($current)) { throw 'Configuration changed during setup' }
             Assert-NoReparseAncestors $dir
@@ -405,7 +421,7 @@ function Save-ConfigAtomic([string]$Path,[byte[]]$Original,[bool]$Existed,[strin
             [IO.File]::Move($temp,$Path)
             $State.ContentSaved=$true
         }
-        [IO.File]::SetAccessControl($Path,$privateAcl)
+        Assert-PrivateFileAcl $Path $privateAcl
     } finally {
         try { Assert-NoReparseAncestors $dir; if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } } catch { }
     }
